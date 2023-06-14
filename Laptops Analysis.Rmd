@@ -1,0 +1,1663 @@
+---
+output: word_document
+---
+# IST 707 - Applied Machine Learning - Final Project
+## Name: Sean Deery, Mark Stiles, Chris Drabb
+## Date: 2023-06-08
+
+# General
+
+The following analysis will focus on the Laptop League dataset. The dataset is a product inventory from the [FlipKart website] (https://www.flipkart.com/laptops-store). Laptops are an important tool for many people. There are lots of options and factors to consider when buying one. It’s easy to get overwhelmed by the number of variations but there’s a lot of standard configurations that you can choose from to meet your specific need. This analysis will aim to answer what those common configurations are, what price points they break down into and to ultimately predict the price given a specific set of options .
+
+```{r setup, include=FALSE}
+# Hide some messaging
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup and Libraries
+```{r, echo=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(forcats)
+library(arules)
+library(arulesViz)
+library(datasets)
+library(GGally)
+library(FactoMineR)
+library(e1071)
+library(naivebayes)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(sqldf)
+library(class)
+library(randomForest)
+library(mclust)
+library(cluster)
+library(factoextra)
+```
+
+```{r}
+# setup colors
+syracuseOrange <- "#D44500"
+syracuseBlue <- "#0C233f"
+```
+
+### Functions
+
+Many of the repeatable processes have been converted to functions and loaded first to be used as-needed.
+
+```{r}
+# This function splits a dataset by a percentage
+get_split = function(data_set, percent_amount)
+{
+  split_set = sample(nrow(data_set),nrow(data_set)*percent_amount)  
+  return(split_set)
+}
+
+# This function measures the accuracy of a prediction result and returns a percentage
+get_accuracy_rate = function(results_table, total_cases) 
+{
+  diagonal_sum = sum(diag(results_table))
+  acc = (diagonal_sum / total_cases)*100
+  return(acc)
+}
+
+# The next set of functions are wrappers for the train_model function with presets
+train_bayes = function(data_set)
+{
+  results = train_model(data_set, "bayes")
+  return(results)
+}
+
+train_tree = function(data_set, control_obj_value)
+{
+  results = train_model(data_set, "tree", control_obj=control_obj_value)
+  return(results)
+}
+
+train_knn = function(data_set, kguess_value)
+{
+  results = train_model(data_set, "knn", kguess_num=kguess_value)
+  return(results)
+}
+
+train_svm = function(data_set, kernel_type_value, cost_num_value)
+{
+  results = train_model(data_set, "svm", kernel_type=kernel_type_value, cost_num=cost_num_value)
+  return(results)
+}
+
+train_forest = function(data_set, replace_type_value)
+{
+  results = train_model(data_set, "forest", replace_type=replace_type_value)
+  return(results)
+}
+
+# This function handles the CV folding in the same way for each model. The specified model is trained and then runs a prediction on holdout values
+train_model = function(data_set, model_type, kguess_num=7, kernel_type="radial", replace_type=FALSE, cost_num=1, control_obj=NULL, distance_method="euclidean", cluster_method="ward.D")
+{
+  kfolds = 5
+  holdout_set <- split(sample(1:nrow(data_set)), 1:kfolds)
+  
+  all_results <- data.frame(orig=c(), pred=c())
+  for (k in 1:kfolds) 
+  {
+    new_test <- data_set[holdout_set[[k]], ]
+    new_train <- data_set[-holdout_set[[k]], ]
+    new_test_no_label <- new_test[-c(1)]
+    new_test_just_label <- new_test[c(1)]
+    
+    pred_values = NULL
+    if (model_type == "knn")
+    {
+      pred_values = knn(train=new_train, test=new_test, cl=new_train$CostCategory, k=kguess_num, prob=FALSE)  
+    }
+    else if (model_type == "svm")
+    {
+      svm_model = svm(CostCategory ~ ., new_train, kernel=kernel_type, na.action=na.pass, cost=cost_num)
+      pred_values = predict(svm_model, new_test_no_label, type=c("class"))
+    }
+    else if (model_type == "forest")
+    {
+      forest_model = randomForest(CostCategory ~ ., new_train, replace=replace_type, na.action=na.pass)
+      pred_values = predict(forest_model, new_test_no_label, type=c("class"))
+    }
+    else if (model_type == "bayes")
+    {
+      bayes_model = naiveBayes(CostCategory ~ ., new_train, na.action=na.pass)
+      pred_values = predict(bayes_model, new_test_no_label)
+    }
+    else if (model_type == "tree")
+    {
+      tree_model <- rpart(CostCategory ~ ., new_train, method="class", control=control_obj)
+      pruned_tree_model <- prune(tree_model, cp=tree_model$cptable[which.min(tree_model$cptable[,"xerror"]),"CP"])
+      pred_values = predict(pruned_tree_model, new_test_no_label, type="class")
+    }
+    
+    all_results = rbind(all_results, data.frame(orig=new_test_just_label$CostCategory, pred=pred_values))
+  }
+  table_results = table(all_results$orig, all_results$pred)
+  accuracy_results = get_accuracy_rate(table_results, length(all_results$pred))
+  
+  return(accuracy_results)
+}
+
+# This function will scale down data to between zero and one
+normalize <- function(x, column) {
+  return ((x[,column] - min(x[,column])) / (max(x[,column]) - min(x[,column])))
+}
+```
+
+# Analysis and Models
+
+## Laptop Data
+
+Laptop League: A Comprehensive Dataset for Laptops - https://www.kaggle.com/datasets/shrutiambekar/laptop-league-a-comprehensive-dataset-for-laptops
+
+```{r}
+# Variables
+
+# Company:       This column represents the Laptops Company name.
+# Rating:        The average rating (out of 5) of the laptop based on user reviews.
+# No_of_ratings: The number of ratings provided by users for the laptop.
+# Review:        A brief summary of the user reviews for the laptop.
+# Size:          The size of the laptop's screen in Cm.
+# Processor:     The brand and model of the laptop's processor.
+# RAM:           The amount of Random Access Memory (RAM) in the laptop in gigabytes (GB).
+# Memory:        The storage capacity of the laptop's hard disk drive (HDD) or solid-state drive (SSD) in gigabytes (GB).
+# OpSys:         The operating system installed on the laptop, such as Windows, macOS, or Linux or Others
+# Price:         The current price of the laptop in INDIAN INR().
+# MRP:           The manufacturer's suggested retail price (MRP)INDIAN INR()
+# ImgURL:        The URL of the image of the laptop.
+```
+
+### loading the data
+```{r}
+laptops <- read.csv("Laptop_Information.csv")
+str(laptops)
+```
+
+### Null Checking
+```{r}
+sum(is.na(laptops))
+```
+
+### Cleanup and Feature Creation
+```{r}
+# fix outlier sizes
+laptops[laptops$Size == 103,]$Size = 41
+laptops[laptops$Size == 101,]$Size = 39
+laptops[laptops$Size == 97,]$Size = 38
+laptops[laptops$Size == 89,]$Size = 35
+
+# adding missing or incorrect values based on manual lookups to the source site of the dataset
+
+# setting conditions
+aw_cond = laptops$Company == "ALIENWARE"
+price_cond_1 = laptops$Price == 188490
+price_cond_2 = laptops$Price == 202490
+price_cond_3 = laptops$Price == 250000
+price_cond_4 = laptops$Price == 325990
+# alienware uses windows
+laptops[aw_cond,]$OpSys = "64 bit Windows 10 Operating System"
+# low end alienware
+laptops[aw_cond & price_cond_1,]$Memory = "512 GB SSD"
+laptops[aw_cond & price_cond_1,]$Processor = "Intel Core i7 Processor (10th Gen)"
+laptops[aw_cond & price_cond_1,]$RAM = "16"
+# mid range alienware
+laptops[aw_cond & (price_cond_2 | price_cond_3),]$Memory = "1 TB SSD"
+laptops[aw_cond & (price_cond_2 | price_cond_3),]$Processor = "Intel Core i7 Processor (10th Gen)"
+laptops[aw_cond & (price_cond_2 | price_cond_3),]$RAM = "16"
+# high end alienware
+laptops[aw_cond & price_cond_4,]$Memory = "1 TB SSD"
+laptops[aw_cond & price_cond_4,]$Processor = "Intel Core i9 Processor (10th Gen)"
+laptops[aw_cond & price_cond_4,]$RAM = "32"
+# chrome has one memory size
+laptops[grep("Chrome", laptops$OpSys),]$Memory = "64 GB EMMC"
+# update keyed on nvidia specs that matched with a brand in site search results
+laptops[grep("1050", laptops$Processor),]$Memory = "1 TB HDD"
+laptops[grep("1050", laptops$Processor),]$OpSys = "64 bit Windows 10 Operating System"
+laptops[grep("1050", laptops$Processor),]$Processor = "Intel Core i5 Processor (7th Gen)"
+# same nvidia specs new field
+laptops[grep("1050", laptops$OpSys),]$Processor = "Intel Core i7 Processor (7th Gen)"
+laptops[grep("1050", laptops$OpSys),]$Memory = "1 TB HDD"
+laptops[grep("1050", laptops$OpSys),]$OpSys = "Linux"
+# new nvidia specs
+laptops[grep("1650", laptops$Processor),]$Memory = "512 GB SSD"
+laptops[grep("1650", laptops$Processor),]$OpSys = "64 bit Windows 10 Operating System"
+laptops[grep("1650", laptops$Processor),]$Processor = "Intel Core i5 Processor (10th Gen)"
+# MSI nvidia specs
+laptops[intersect(grep("2060", laptops$Processor),which(laptops$Company == "MSI",TRUE)) ,]$Memory = "512 GB SSD"
+laptops[intersect(grep("2060", laptops$Processor),which(laptops$Company == "MSI",TRUE)) ,]$OpSys = "64 bit Windows 10 Operating System"
+laptops[intersect(grep("2060", laptops$Processor),which(laptops$Company == "MSI",TRUE)) ,]$Processor = "Intel Core i7 Processor (8th Gen)"
+# DELL nvidia specs
+laptops[intersect(grep("2070", laptops$Processor),which(laptops$Company == "DELL",TRUE)) ,]$Memory = "1 TB SSD"
+laptops[intersect(grep("2070", laptops$Processor),which(laptops$Company == "DELL",TRUE)) ,]$OpSys = "64 bit Windows 10 Operating System"
+laptops[intersect(grep("2070", laptops$Processor),which(laptops$Company == "DELL",TRUE)) ,]$Processor = "Intel Core i9 Processor (10th Gen)"
+# DELL new nvidia specs and unique review value
+laptops[intersect(grep("3050", laptops$Processor),which(laptops$Company == "DELL",TRUE)) ,]$Memory = "512 GB SSD"
+laptops[intersect(grep("3050", laptops$Processor),which(laptops$Company == "DELL",TRUE)) ,]$OpSys = "64 bit Windows 10 Operating System"
+laptops[intersect(grep("3050", laptops$Processor),which(laptops$Company == "DELL" & laptops$Review == 9,TRUE)) ,]$Processor = "AMD Ryzen 5 Hexa Core Processor"
+laptops[intersect(grep("3050", laptops$Processor),which(laptops$Company == "DELL" & laptops$Review == 1,TRUE)) ,]$Processor = "AMD Ryzen 7 Octa Core Processor"
+# update where 16 gb was reported in operating system field
+laptops[grep("16 GB", laptops$OpSys),]$RAM = 16
+
+# Create a new column ProcessorManufacturer from the Processor Column
+laptops <- laptops %>% mutate(ProcessorManufacturer = case_when(
+                       grepl('Intel', Processor, ignore.case = TRUE) ~ 'Intel',
+                       grepl('AMD', Processor, ignore.case = TRUE) ~ 'AMD',
+                       grepl('R3-5425U', Processor, ignore.case = TRUE) ~ 'AMD',
+                       grepl('R5-5625U', Processor, ignore.case = TRUE) ~ 'AMD',
+                       grepl('NVIDIA', Processor, ignore.case = TRUE) ~ 'NVIDIA',
+                       grepl('MediaTek', Processor, ignore.case = TRUE) ~ 'MediaTek',
+                       TRUE ~ 'Unknown'
+                     ))
+
+# Create a new column DiskGB from the Memory and Processor column
+laptops <- laptops %>% mutate(DiskGB = case_when(
+                       grepl('64 GB EMMC', Memory, ignore.case = TRUE) ~ '64',
+                       grepl('1 TB SSD', Memory, ignore.case = TRUE) ~ '1000',
+                       grepl('2 TB SSD', Memory, ignore.case = TRUE) ~ '2000',
+                       grepl('512 GB SSD', Memory, ignore.case = TRUE) ~ '512',
+                       grepl('512 GB SSD', Processor, ignore.case = TRUE) ~ '512', 
+                       grepl('256 GB SSD', Memory, ignore.case = TRUE) ~ '256',
+                       grepl('128 GB SSD', Memory, ignore.case = TRUE) ~ '128',
+                       grepl('1 TB HDD', Memory, ignore.case = TRUE) ~ '1000',
+                       grepl('1 TB HDD|1 TB SSD', Memory, ignore.case = TRUE) ~ '2000',
+                       grepl('1 TB HDD|512 TB SSD', Memory, ignore.case = TRUE) ~ '1512',
+                       grepl('1 TB HDD|256 TB SSD', Memory, ignore.case = TRUE) ~ '1256',
+                       grepl('512 TB HDD|512 TB SSD', Memory, ignore.case = TRUE) ~ '1024',
+                       grepl('256 TB HDD|256 TB SSD', Memory, ignore.case = TRUE) ~ '512',
+                       TRUE ~ 'Unknown'
+                     ))
+
+# Create a new column OS from the OpSys and Memory column
+laptops <- laptops %>% mutate(OS = case_when(
+                       grepl('Windows', OpSys, ignore.case = TRUE) ~ 'Windows',
+                       grepl('Windows', Processor, ignore.case = TRUE) ~ 'Windows',
+                       grepl('Windows', Memory, ignore.case = TRUE) ~ 'Windows',
+                       grepl('Win', OpSys, ignore.case = TRUE) ~ 'Windows',
+                       grepl('Win', Memory, ignore.case = TRUE) ~ 'Windows',
+                       grepl('Mac OS', OpSys, ignore.case = TRUE) ~ 'Mac OS',
+                       grepl('Chrome', OpSys, ignore.case = TRUE) ~ 'Chrome OS',
+                       grepl('Prime OS', OpSys, ignore.case = TRUE) ~ 'Prime OS',
+                       grepl('DOS', OpSys, ignore.case = TRUE) ~ 'DOS',
+                       grepl('Linux', OpSys, ignore.case = TRUE) ~ 'Linux',
+                       TRUE ~ 'Unknown'
+                     ))
+
+# Create a new column Cores from the Processor Column originating from the product website detail page
+laptops <- laptops %>% mutate(Cores = case_when(
+                       grepl('Dual', Processor, ignore.case = TRUE) ~ '2',
+                       grepl('Quad', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Hexa', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Octa', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('2 Cores', Processor, ignore.case = TRUE) ~ '2',
+                       grepl('6 Cores', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('10 Cores', Processor, ignore.case = TRUE) ~ '10',
+                       grepl('14 Cores', Processor, ignore.case = TRUE) ~ '14',
+                       grepl('Apple M1 Pro Processor', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Apple M1 Max Processor', Processor, ignore.case = TRUE) ~ '10',
+                       grepl('Apple M1 Processor', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Apple M2 Max Processor', Processor, ignore.case = TRUE) ~ '10',
+                       grepl('Apple M2 Pro Processor', Processor, ignore.case = TRUE) ~ '12',
+                       grepl('Apple M2 Processor', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i3 Processor \\(10th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i3 Processor \\(11th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i3 Processor \\(12th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i3 Processor \\(13th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i3 Processor \\(7th Gen\\)', Processor, ignore.case = TRUE) ~ '2',
+                       grepl('Evo Core i5 Processor', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i5 Processor \\(10th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i5 Processor \\(11th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i5 Processor \\(12th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i5 Processor \\(13th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i5 Processor \\(4th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i5 Processor \\(7th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i5 Processor \\(8th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i5 Processor \\(9th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i7 Processor \\(10th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i7 Processor \\(11th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i7 Processor \\(12th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i7 Processor \\(13th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i7 Processor \\(7th Gen\\)', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Intel Core i7 Processor \\(8th Gen\\)', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Intel Core i9 Processor \\(10th Gen\\)', Processor, ignore.case = TRUE) ~ '10',
+                       grepl('Intel Core i9 Processor \\(11th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i9 Processor \\(12th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Core i9 Processor \\(13th Gen\\)', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Intel Pentium Silver Processor', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('MediaTek MediaTek Kompanio 500 Processor', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('MediaTek MediaTek MT8788 Processor', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Powered by 11th Gen Intel Evo Core i5 Processor ', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Processor: 10th Generation Intel Core i3-1005G1 Processor', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Processor: AMD Ryzen 7-5825U', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Processor: AMD Ryzen R5-5600H', Processor, ignore.case = TRUE) ~ '6',
+                       grepl('Processor: Intel i7-11800H', Processor, ignore.case = TRUE) ~ '8',
+                       grepl('Processor: Intel PQC-N5030', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Processor: R3-5425U', Processor, ignore.case = TRUE) ~ '4',
+                       grepl('Processor: R5-5625U', Processor, ignore.case = TRUE) ~ '6',
+                       TRUE ~ 'Unknown'
+                     ))
+
+# Remove the character columns
+laptops <- laptops[,!(names(laptops) %in% c("X", "ImgURL", "Memory", "OpSys", "Processor"))]
+
+# convert company to a factor
+laptops$Company <- as.factor(laptops$Company)
+
+# convert processor manufacturer to a factor
+laptops$ProcessorManufacturer <- as.factor(laptops$ProcessorManufacturer)
+
+# convert ram to a factor
+laptops$RAM <- ordered(laptops$RAM, levels=c("4", "8", "16","32"))
+
+# convert memory to an ordered factor
+laptops$DiskGB <- ordered(laptops$DiskGB, levels=c("64", "128", "256", "512", "1000", "2000", "Unknown"))
+
+# convert memory to an ordered factor
+laptops$Cores <- ordered(laptops$Cores, levels=c("2", "4", "6", "8", "10", "12", "14", "Unknown"))
+
+# convert OS to a factor
+laptops$OS <- as.factor(laptops$OS)
+
+# convert Rupees to USD
+laptops$Price = unlist(lapply(laptops$Price * 0.012, function(x) if(is.numeric(x)) round(x, 2) else x))
+laptops$MRP = unlist(lapply(laptops$MRP * 0.012, function(x) if(is.numeric(x)) round(x, 2) else x))
+
+# Cost Category: Discretization of Price (an arbitrary list)
+laptops$CostCategory = cut(laptops$Price,	breaks=c(0,500,1000,2000,3000,4000,Inf),labels=c("Lightweight","Consumer","Commercial", "Gaming", "Mining","Scientific"))
+laptops = laptops %>% relocate(CostCategory)
+  
+# Difference between suggested retail price and retail price (negative values are when retail price is higher than suggested)
+laptops$CostSavings = laptops$MRP - laptops$Price
+
+# Deal Quality: compare average component ratio to price ratio (capped at 2000 because anything higher than that is a fair deal or worse)
+ram_ratio = (as.numeric(laptops$RAM) / 4)
+disk_ratio = (as.numeric(laptops$DiskGB) / 6)
+cores_ratio = (as.numeric(laptops$RAM) / 7)
+component_ratio = (ram_ratio + disk_ratio + cores_ratio) / 3
+price_ratio = laptops$Price / 2000
+laptops$DealQuality = mapply(function(x,y) if(x > y) return(1) else return(0), component_ratio, price_ratio)
+```
+
+### Numerical Laptop Dataset
+```{r}
+# laptop subset with factors converted to numeric
+laptops_num = laptops[,c("CostCategory", "Company", "Rating", "Size", "RAM", "Price", "ProcessorManufacturer", "DiskGB", "OS", "Cores", "CostSavings")]
+
+laptops_num$RAM = as.numeric(laptops_num$RAM)
+laptops_num$DiskGB = as.numeric(laptops_num$DiskGB)
+laptops_num$Cores = as.numeric(laptops_num$Cores)
+laptops_num$Company = as.numeric(laptops_num$Company)
+laptops_num$ProcessorManufacturer = as.numeric(laptops_num$ProcessorManufacturer)
+laptops_num$OS = as.numeric(laptops_num$OS)
+
+# remove unknown values
+laptops_num = laptops_num[laptops_num$Cores != 8 & laptops_num$DiskGB != 7,]
+```
+
+### Normalized Laptop Dataset
+```{r}
+# normalize ranges to put the variables on equal footing
+laptops_norm = data.frame(CostCategory = laptops_num$CostCategory)
+laptops_norm$Company = normalize(laptops_num, "Company")
+laptops_norm$Rating = normalize(laptops_num, "Rating")
+laptops_norm$Size = normalize(laptops_num, "Size")
+laptops_norm$RAM = normalize(laptops_num, "RAM")
+laptops_norm$Price = normalize(laptops_num, "Price")
+laptops_norm$ProcessorManufacturer = normalize(laptops_num, "ProcessorManufacturer")
+laptops_norm$DiskGB = normalize(laptops_num, "DiskGB")
+laptops_norm$OS = normalize(laptops_num, "OS")
+laptops_norm$Cores = normalize(laptops_num, "Cores")
+laptops_norm$CostSavings = normalize(laptops_num, "CostSavings")
+laptops_norm$CostCategory = laptops_num$CostCategory
+```
+
+### Structure and Summary
+```{r}
+print("Original")
+str(laptops)
+print("Numerical")
+str(laptops_num)
+print("Normalized")
+str(laptops_norm)
+```
+
+## Exploration and Visualization
+
+### Correlation Pairs
+
+To identify which variables might be good predictors, the correlation pairs was generated to quickly surface good candidates.
+
+```{r}
+# filter out the unknown categories from core count and disk size
+pair_columns = c("Rating", "Size", "RAM", "Price", "DiskGB", "Cores", "CostSavings")
+
+pair_plot = ggpairs(laptops_norm, columns=pair_columns, aes(color=CostCategory, alpha = 0.5), upper=list(continuous = wrap("cor", size = 1.5)), labs(title="Figure 1"))
+ggsave(file="pair-plot.jpg")
+print(pair_plot)
+```
+
+Figure 1 shows some interesting matches for price. The RAM, DiskGB, Cores as well as Size and Rating to a lesser degree and a small subset of products within cost savings which are anomalous prices compared to Manufacturer Recommended Prices (MRP). 
+
+### Company
+
+The Company values span 18 product brands. 
+
+```{r}
+# display the count of laptops per company
+sort(summary(laptops$Company), decreasing = TRUE)
+```
+
+The values converted to proportions for each brand 
+
+```{r}
+# Get percentages for each category
+sort(summary(laptops$Company)/sum(summary(laptops$Company)), decreasing = TRUE)
+```
+
+```{r}
+# Create a barplot of Company
+laptops%>% ggplot(aes(x=fct_infreq(Company))) + geom_bar(fill=syracuseOrange) + 
+  ggtitle("Figure 2 - Laptops per Company") + xlab("") + ylab("Count") + theme(plot.title = element_text(hjust=0.5)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 2 shows the distribution of Company brands within the dataset. Lenovo has the most along with ASUS, HP and DELL. A second tier including Acer, MSI, APPLE and Infinix make up lower but substantial amount. The rest are a long tail of small samples. 
+
+```{r}
+laptop_means = laptops %>% group_by(Company) %>% summarize(AvgPrice = mean(Price))
+
+ggplot(laptop_means) + 
+  aes(x=reorder(Company, -AvgPrice), y=AvgPrice) + 
+  geom_bar(position="dodge",stat="identity", fill=syracuseOrange) + 
+  labs(x="", y="Price", title="Figure 3 - Average Laptop Price per Company") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 3 shows the average price per Company. The brand with the highest average price is ALIENWARE and APPLE with a quick drop followed by a long tail of linearly decreasing values for the remaining brands. Although Lenovo, ASUS, HP and DELL have the highest number of laptops they make substantially less per laptop than ALIENWARE and APPLE. 
+
+### Rating
+```{r}
+# Get a summary of rating
+summary(laptops$Rating)
+
+# Plot the distribution of ratings
+ggplot(laptops) + 
+  aes(x=Rating) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 4 - Ratings Distribution") + 
+  labs(x="Rating", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 4 shows that most of the ratings are between 4 and 5. It might indicate the business is carrying products they are confident they can sell. 
+
+```{r}
+# Find outliers that are 3 standard deviations away from the mean
+# get mean and Standard deviation
+mean = mean(laptops$Rating)
+std = sd(laptops$Rating)
+
+# get threshold values for outliers
+Tmin = mean-(3*std)
+Tmax = mean+(3*std)
+
+# find the outliers
+low_ratings <- laptops[which(laptops$Rating < Tmin | laptops$Rating > Tmax),]
+low_ratings[which.min(low_ratings$Rating),]
+low_ratings
+
+# Plot the distribution of ratings
+ggplot(low_ratings) + 
+  aes(x=Rating) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=10) +
+  ggtitle("Figure 5 - Low Ratings Distribution") + 
+  labs(x="Rating", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 5, and the tabular output show the low rating distribution and composition. What's interesting is that most have a price well below the MRP. They also have very few number of ratings but what's most unexpected is that most are indicated as a good deal and commercial grade. Perhaps a poor build or other component dragged down a model with higher expected potential. 
+
+```{r}
+ggplot(laptops) + 
+  aes(x=Rating,y=Price) + 
+  geom_point(color=syracuseOrange) +
+  labs(x="Rating", y="Price", title="Figure 6 - Price by Rating") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 6, unsurprisingly shows an increase in Rating corresponds to an increase in Price.
+
+### No_of_ratings
+```{r}
+# Get a summary of number of ratings
+summary(laptops$No_of_ratings)
+
+# Plot the distribution of number of ratings
+ggplot(laptops) + 
+  aes(x=No_of_ratings) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=20) +
+  ggtitle("Figure 7 - Number of Ratings Distribution") + 
+  labs(x="Rating Count per Product", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 7 shows the distribution of Rating Count per Product. Most laptops have low rating counts but there's an unusual spike around 2500. This could be worth further investigation. There's also a long tail of review counts up almost through 1500. 
+
+```{r}
+# Find outliers that are 3 standard deviations away from the mean
+# get mean and Standard deviation
+mean = mean(laptops$No_of_ratings)
+std = sd(laptops$No_of_ratings)
+
+# get threshold values for outliers
+Tmin = mean-(3*std)
+Tmax = mean+(3*std)
+
+# find the outliers
+high_no_ratings <- laptops[which(laptops$No_of_ratings < Tmin | laptops$No_of_ratings > Tmax),]
+high_no_ratings[which.max(high_no_ratings$No_of_ratings),]
+high_no_ratings
+
+# Plot the distribution of ratings
+ggplot(high_no_ratings) + 
+  aes(x=No_of_ratings) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=15) +
+  ggtitle("Figure 8 - High Number of Ratings Distribution") + 
+  labs(x="Rating Count per Product", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 8 shows the distribution of high number of rating counts. 
+
+### Review
+```{r}
+# Get a summary of number of reviews
+summary(laptops$Review)
+
+# Plot the distribution of number of reviews
+ggplot(laptops) + 
+  aes(x=Review) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=20) +
+  ggtitle("Figure 9 - Number of Reviews Distribution") + 
+  labs(x="Review per Product", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 9 shows the distribution of Numbers of Review per Product. There's mostly less than 250 Number of Reviews per product. 
+
+```{r}
+# Find outliers that are 3 standard deviations away from the mean
+# get mean and Standard deviation
+mean = mean(laptops$Review)
+std = sd(laptops$Review)
+
+# get threshold values for outliers
+Tmin = mean-(3*std)
+Tmax = mean+(3*std)
+
+# find the outliers
+high_no_reviews <- laptops[which(laptops$Review < Tmin | laptops$Review > Tmax),]
+high_no_reviews[which.max(high_no_reviews$Review),]
+high_no_reviews
+
+# Plot the distribution of reviews
+ggplot(high_no_reviews) + 
+  aes(x=Review) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 10 - High Number of Reviews Distribution") + 
+  labs(x="Review per Product", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 10 shows the distribution of High Numbers of Review per Product. There's mostly less than 250 Number of Reviews per product. 
+
+### Size
+```{r}
+# Get a summary of number of reviews
+summary(laptops$Size)
+
+# Plot the distribution of number of reviews
+ggplot(laptops) + 
+  aes(x=Size) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=20) +
+  ggtitle("Figure 11 - Screen Size Distribution") + 
+  labs(x="Size (in cm)", y="Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 11 shows the distribution of screen size. There appears to be two ranges of popular sizes; 36 cm or 40 cm. 
+
+```{r}
+ggplot(laptops) + 
+  aes(x=Size,y=Price) + 
+  geom_point(color=syracuseOrange) +
+  labs(x="Size (in cm)", y="Price", title="Figure 12 - Price by Size") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 12 shows the Price by Size. There's a strong correlation between larger screen sizes and higher prices. 
+
+```{r}
+# Find outliers that are 3 standard deviations away from the mean
+# get mean and Standard deviation
+mean = mean(laptops$Size)
+std = sd(laptops$Size)
+
+# get threshold values for outliers
+Tmin = mean-(3*std)
+Tmax = mean+(3*std)
+
+# find the outliers
+high_size <- laptops[which(laptops$Size < Tmin | laptops$Size > Tmax),]
+high_size[high_size$Size==max(high_size$Size),]
+high_size
+
+# Plot the distribution of high size
+ggplot(high_size) + 
+  aes(x=Size) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=10) +
+  labs(x="Size (in cm)", y="Count", title="Figure 13 - High Monitor Size (Cm) Distribution") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 13 shows the distribution of larger screen sizes.  
+
+### Processor Manufacturer
+```{r}
+# display the count of laptops per company
+sort(summary(laptops$ProcessorManufacturer), decreasing = TRUE)
+```
+
+```{r}
+# Get percentages for each category
+sort(summary(laptops$ProcessorManufacturer)/sum(summary(laptops$ProcessorManufacturer)), decreasing = TRUE)
+```
+
+```{r}
+# Create a barplot of Company
+ggplot(laptops[laptops$ProcessorManufacturer != "Unknown",]) + 
+  aes(x=fct_infreq(ProcessorManufacturer)) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee") +
+  ggtitle("Figure 14 - Processor Manufacturer Distribution") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 14 shows the distribution of Processor Manufacturers. Intel makes almost three times as many of the laptop processors than the next competitor AMD. MediaTek and NVIDIA are barely represented. 
+
+```{r}
+ggplot(laptops[laptops$ProcessorManufacturer != "Unknown",]) + 
+  aes(x=factor(ProcessorManufacturer, levels=c("Intel", "AMD", "MediaTek", "NVIDIA")),y=Price) + 
+  geom_boxplot(outlier.colour=syracuseOrange, outlier.shape=16, outlier.size=2, show.legend=FALSE, color=syracuseOrange) + 
+  labs(x="", y="USD", title="Figure 15 - Price by Manufacturer") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 15 shows the Price distribution per Processor Manufacturer. MediaTek has the lowest Price point of the group. NVIDIA has a similar average price as Intel or AMD but the latter two have many more outliers at higher price bands. 
+
+### RAM
+```{r}
+# display the count of each RAM type
+sort(summary(laptops$RAM), decreasing = TRUE)
+```
+
+```{r}
+# Get percentages for each RAM type
+sort(summary(laptops$RAM)/sum(summary(laptops$RAM)), decreasing = TRUE)
+```
+
+```{r}
+# Create a barplot of Laptops per RAM
+ggplot(laptops) + 
+  aes(x=factor(RAM, level=c("4", "8", "16", "32"))) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee") +
+  ggtitle("Figure 16 - RAM Size Distribution") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 16 shows the distribution of RAM sizes in Gigabytes (GB). The 8 and 16 GB RAM make up the majority of the laptop RAM sizes. There's slightly more 32 GB laptops than 4 GB laptops but the general distribution is normal. 
+
+```{r}
+ggplot(laptops) + 
+  aes(x=RAM,y=Price) + 
+  geom_boxplot(outlier.colour=syracuseOrange, outlier.shape=16, outlier.size=2, show.legend=FALSE, color=syracuseOrange) +
+  labs(x="Gigabytes", y="USD", title="Figure 17 - Price by RAM Size") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 17 shows the Price distribution by RAM size. There is a strong correlation between higher RAM sizes and higher prices. The relationship appears to be more exponential than linear and could explain why there are much fewer laptops with the max amount of RAM. The cost at the high end is prohibitive. 
+
+### Disk Size
+```{r}
+# display the count of each Memory type
+sort(summary(laptops$DiskGB), decreasing = TRUE)
+```
+
+```{r}
+# Get percentages for each Memory type
+sort(summary(laptops$DiskGB)/sum(summary(laptops$DiskGB)), decreasing = TRUE)
+```
+
+```{r}
+# Create a barplot of Memory
+ggplot(laptops[laptops$DiskGB != "Unknown",]) + 
+  aes(x=factor(DiskGB, level=c("64", "128", "256", "512", "1000", "2000"))) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee") +
+  ggtitle("Figure 18 - Laptop Count by Disk Size") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 18 shows the distribution of Disk Size in Gigabytes (GB). The Disk Sizes are a left skewed normal distribution centering on 512 GB disk drives.
+
+```{r}
+ggplot(laptops[laptops$DiskGB != "Unknown",]) + 
+  aes(x=factor(DiskGB, level=c("64", "128", "256", "512", "1000", "2000")), y=Price) + 
+  geom_boxplot(outlier.colour=syracuseOrange, outlier.shape=16, outlier.size=2, show.legend=FALSE, color=syracuseOrange) +
+  labs(x="Gigabytes", y="USD", title="Figure 19 - Price by Disk Size") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 19 shows the Price distribution for the Disk Size. Similar to the RAM size, the Disk Size appears to have an exponential relationship to the price. This could make the higher disk sizes cost prohibitive and generally for purposes that can bear the cost. 
+
+### OS
+```{r}
+# display the count of each OS type
+sort(summary(laptops$OS), decreasing = TRUE)
+```
+
+```{r}
+# Get percentages for each OS type
+sort(summary(laptops$OS)/sum(summary(laptops$OS)), decreasing = TRUE)
+```
+
+```{r}
+# Create a barplot of OS
+ggplot(laptops[laptops$OS != "Unknown",]) + 
+  aes(x=fct_infreq(OS)) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee") +
+  labs(x="", y="", title="Figure 20 - Laptop Count by OS") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 21 shows the distribution of Operating Systems. Nearly all are Windows with a small amount using Mac OS. There's a very small distribution between the rest of the OS's. 
+
+```{r}
+ggplot(laptops[laptops$OS != "Unknown",]) + 
+  aes(x=factor(OS, levels=c("Windows", "Mac OS", "Chrome OS", "DOS", "Linux", "Prime OS")),y=Price) + 
+  geom_boxplot(outlier.colour=syracuseOrange, outlier.shape=16, outlier.size=2, show.legend=FALSE, color=syracuseOrange) +
+  labs(x="", y="USD", title="Figure 22 - Price by OS") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 22 shows the Price distribution per Operating System. Apple commands the highest price premium for it's brand. Windows has a similar price point unexpectedly with Linux but Windows also has a high number of high priced outliers. The remaining systems share the low end of the market. 
+
+### Price
+```{r}
+# Get a summary of price
+summary(laptops$Price)
+
+# Plot the distribution of price
+options(scipen=999)
+
+ggplot(laptops) + 
+  aes(x=Price) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 23 - Laptop Count by Price") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 23 shows the Price distribution. Most prices are below $1,000. There's a significant number of laptops between $1,000 and $2,000 but few beyond that. The high end does reach almost up to $5,000. 
+
+```{r}
+# Find outliers that are 3 standard deviations away from the mean
+# get mean and Standard deviation
+mean = mean(laptops$Price)
+std = sd(laptops$Price)
+
+# get threshold values for outliers
+Tmin = mean-(3*std)
+Tmax = mean+(3*std)
+
+# find the outliers
+high_price <- laptops[which(laptops$Price < Tmin | laptops$Price > Tmax),]
+high_price[high_price$Price==max(high_price$Price),]
+high_price
+
+# Plot the distribution of high size
+ggplot(high_price) + 
+  aes(x=Price) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=20) +
+  labs(x="", y="", title="Figure 24 - High Price Distribution") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 24 shows the high end of the price distribution. 
+
+```{r}
+ggplot(laptops) +
+  aes(x=Company, y=Price) +
+  geom_jitter(shape=16, position=position_jitter(0.4), color=syracuseOrange) +
+  labs(x="", y="", title="Figure 25 - Price Distribution by Company") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+```
+
+Figure 25 shows the price distribution by Company. Seven of the nineteen companies have products with prices that span a wide range of prices. Most do not have high price bands. Interesting but unsurprisingly, Apple has a much higher floor than other companies. 
+
+```{r}
+ggplot(laptops[laptops$OS != "Unknown",]) +
+  aes(x=OS, y=Price) +
+  geom_jitter(shape=16, position=position_jitter(0.4), color=syracuseOrange) +
+  labs(x="", y="", title="Figure 26 - Price Distribution by OS") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+```
+
+Figure 26 shows the Price distribution by Operating System. Windows and Mac OS hold the highest prices but similar to the previous plot, Mac OS has a higher floor price. 
+
+```{r}
+ggplot(laptops[laptops$ProcessorManufacturer != "Unknown",]) +
+  aes(x=ProcessorManufacturer, y=Price) +
+  geom_jitter(shape=16, position=position_jitter(0.4), color=syracuseOrange) +
+  labs(x="", y="", title="Figure 27 - Price Distribution by ProcessorManufacturer") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+```
+
+Figure 27 shows the price Distribution by Processor Manufacturer. AMD and Intel have nearly the entire market and similar price bands although AMD has a slightly higher price floor. 
+
+### MRP
+```{r}
+# Get a summary of mrp
+summary(laptops$MRP)
+
+# Plot the distribution of mrp
+options(scipen=999)
+
+ggplot(laptops) + 
+  aes(x=MRP) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 28 - Manufacturer Recommended Price Distribution") + 
+  labs(x="USD", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 28 shows the distribution of MRP values. Similar to the Price distribution, most of the values are below $1,000. Unlike the Price distribution the center point is slightly higher. This would indicate many of the laptops have a lower price than recommended by the manufacturer. 
+
+```{r}
+ggplot(laptops) + 
+  aes(x=MRP,y=Price) + 
+  geom_point(color=syracuseOrange) +
+  labs(x="MRP USD", y="Price USD", title="Figure 29.1 - Price by MRP") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 29.1 shows a strong correlation between MRP and Price. There's an odd set of outliers whose price is significanly higher than the suggested price. 
+
+```{r}
+ggplot(laptops[laptops$MRP < 1000 & laptops$Price > 1000,]) + 
+  aes(x=Company) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 29.2 - Manufacturer Recommended Price Distribution") + 
+  labs(x="USD", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 29.2 shows that the outliers from the previous plot were predominantly Apple or Lenovo laptops. 
+
+```{r}
+summary(laptops[laptops$MRP < 1000 & laptops$Price > 1000,c("Company", "RAM", "DiskGB", "Cores")])
+```
+
+Further analysis shows that the high prices weren't justified by large RAM sizes, or high numbers of Cores. Most did have a high Disk Size. 
+
+```{r}
+# Find outliers that are 3 standard deviations away from the mean
+# get mean and Standard deviation
+mean = mean(laptops$MRP)
+std = sd(laptops$MRP)
+# get threshold values for outliers
+
+Tmin = mean-(3*std)
+Tmax = mean+(3*std)
+# find the outliers
+
+high_mrp <- laptops[which(laptops$MRP < Tmin | laptops$MRP > Tmax),]
+high_mrp[high_mrp$MRP==max(high_mrp$MRP),]
+high_mrp
+
+# Plot the distribution of high size
+ggplot(high_mrp) + 
+  aes(x=MRP) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=30) +
+  ggtitle("Figure 30 - High Manufacturer Recommended Price Distribution") + 
+  labs(x="USD", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 30 shows the high end of the MRP distribution. 
+
+### Cores
+```{r}
+# Get a summary of cores
+summary(laptops$Cores)
+
+# Plot the distribution of cores
+options(scipen=999)
+
+ggplot(laptops[laptops$Cores != "Unknown",]) + 
+  aes(x=Cores) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee", bins=10) +
+  ggtitle("Figure 31 - CPU Cores Distribution") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 31 shows a normal distribution of CPU Cores. The center sits at 6 cores. Very few have the highest number of cores.
+
+```{r}
+ggplot(laptops[laptops$Cores != "Unknown",]) + 
+  aes(x=factor(Cores),y=Price) + 
+  geom_boxplot(outlier.colour=syracuseOrange, outlier.shape=16, outlier.size=2, show.legend=FALSE, color=syracuseOrange) +
+  labs(x="", y="USD", title="Figure 32 - Price by Core Count") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+### Deal Quality
+```{r}
+# Get a summary of deal quality
+summary(laptops$DealQulity)
+
+# Plot the distribution of deal quality
+options(scipen=999)
+
+laptops_qual = laptops %>% mutate(QualityCategory = ifelse(laptops$DealQuality == 1, "Good Quality", "Bad Quality"))
+
+ggplot(laptops_qual) + 
+  aes(x=QualityCategory) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee", bins=10) +
+  ggtitle("Figure 33 - Deal Quality Distribution") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 33 shows that there are almost four times as many good quality deals as bad quality deals. 
+
+### CostCategory
+```{r}
+# Get a summary of cores
+summary(laptops$CostCategory)
+
+# Plot the distribution of cores
+options(scipen=999)
+
+ggplot(laptops) + 
+  aes(x=CostCategory) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee", bins=10) +
+  ggtitle("Figure 34 - Cost Category Distribution") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 34 shows a right skewed distribution of Cost Categories. Most laptops are consumer grade with a steadily shrinking tail of higher cost laptops. 
+
+```{r}
+ggplot(laptops[laptops$Cores != "Unknown",]) + 
+  aes(x=CostCategory, y=Cores) + 
+  geom_point(color=syracuseOrange) + 
+  ggtitle("Figure 35.1 - Cost Category by Core") + 
+  labs(x="", y="Cores") + 
+  geom_count(aes(size = after_stat(prop), group = 1), color=syracuseOrange, show.legend=FALSE) +
+  scale_size_area(max_size = 10) + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 35 shows the Cost Category by CPU Core Count. There's a strong correlation between higher cost laptop and more CPU Cores. There is a high density of laptops in the Lightweight category with 4 cores, the consumer category with 6 cores or the commercial category with 8 cores. 
+
+```{r}
+ggplot(laptops[laptops$RAM != "Unknown",]) + 
+  aes(x=CostCategory, y=RAM) + 
+  geom_point(color=syracuseOrange) + 
+  ggtitle("Figure 35.2 - Cost Category by RAM") + 
+  labs(x="", y="Gigabytes") + 
+  geom_count(aes(size = after_stat(prop), group = 1), color=syracuseOrange, show.legend=FALSE) +
+  scale_size_area(max_size = 10) + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+```{r}
+ggplot(laptops[laptops$DiskGB != "Unknown",]) + 
+  aes(x=CostCategory, y=DiskGB) + 
+  geom_point(color=syracuseOrange) + 
+  ggtitle("Figure 35.3 - Cost Category by DiskGB") + 
+  labs(x="", y="Gigabytes") + 
+  geom_count(aes(size = after_stat(prop), group = 1), color=syracuseOrange, show.legend=FALSE) +
+  scale_size_area(max_size = 10) + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+```{r}
+ggplot(laptops[laptops$Company != "Unknown",]) + 
+  aes(x=CostCategory, y=Company) + 
+  geom_point(color=syracuseOrange) + 
+  ggtitle("Figure 35.4 - Cost Category by Company") + 
+  labs(x="", y="") + 
+  geom_count(aes(size = after_stat(prop), group = 1), color=syracuseOrange, show.legend=FALSE) +
+  scale_size_area(max_size = 10) + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+### CostSavings
+```{r}
+# Get a summary of cores
+summary(laptops$CostSavings)
+
+# Plot the distribution of cores
+options(scipen=999)
+
+ggplot(laptops) + 
+  aes(x=CostSavings) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 36.1 - Cost Savings Distribution") + 
+  labs(x="", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 36.1 shows the distribution of the Cost Savings. The majority of cost savings sits between $0 and $1,000 dollars. This means that most laptops were sold lower than the MRP. There are a small but significant group of laptops that are sold at a cost much higher than than MRP. 
+
+```{r}
+# see how cost savings are distributed between good and bad deals
+ggplot(laptops[laptops$DealQuality == 0,]) + 
+  aes(x=CostSavings) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 36.2 - Cost Savings Distribution for Poor Deals") + 
+  labs(x="Count", y="Cost Savings") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+ggplot(laptops[laptops$DealQuality == 1,]) + 
+  aes(x=CostSavings) + 
+  geom_histogram(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 36.3 - Cost Savings Distribution for Good Deals") + 
+  labs(x="Count", y="Cost Savings") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figures 36.2 and 36.3 shows further examination on the cost savings differences between good and bad deals. The good deals tend to have a higher cost savings than bad deals which is expected. 
+
+```{r}
+ggplot(laptops) + 
+  aes(x=Company, y=CostSavings) + 
+  geom_boxplot(outlier.colour=syracuseOrange, outlier.shape=16, outlier.size=2, show.legend=FALSE, color=syracuseOrange) + 
+  ggtitle("Figure 37 - Cost Savings by Company") + 
+  labs(x="", y="Cost Savings") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 37 shows the Cost Savings distribution by Company. Confirming earlier results, APPLE and lenovo make up a considerable volume of the laptops costing more than their MRP. 
+
+```{r}
+ggplot(laptops) + 
+  aes(x=Price, y=CostSavings) + 
+  ggtitle("Figure 38 - Cost Savings by Price") + 
+  labs(x="Price", y="Cost Savings") + 
+  geom_point(color=syracuseOrange) +
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 38 shows little correlation between Price point and Cost Savings with an odd set of outliers whose Cost Savings decreases with Price. 
+
+```{r}
+ggplot(laptops[laptops$CostSavings < 500 & laptops$Price > 1000,]) + 
+  aes(x=Company) + 
+  geom_bar(fill=syracuseOrange, color="#eeeeee", bins=50) +
+  ggtitle("Figure 39 - Cost Savings Distribution by Company") + 
+  labs(x="USD", y="") + 
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+Figure 39 shows that the outliers from a varied group of companies. Although the most companies with wide divergence between Price and MRP were APPLE and Lenovo, the volume of the negative Cost Savings was more evenly spread out. 
+
+
+### Linear Model
+```{r}
+linear_model = lm(formula = Price ~ Company + Rating + Size + RAM + ProcessorManufacturer + DiskGB + OS + Cores + CostSavings, data=laptops_norm)
+summary(linear_model)
+```
+
+Using a linear model to explore and identify which relationships were significant shows that nearly all of the values except Rating contributed to the prediction of Price. The linear model is very different from the classification models used later to predict the PriceCategory but is a reasonable way to confirm which values were helpful in those predictions. 
+
+
+# Results
+
+## Association Rule Mining
+
+Association Rule Mining finds rules that will predict the occurrence of an item based on the occurrences of other items in the transaction. The Apriori algorithm is a method to efficiently generate frequent item sets and then prune rules with low confidence. To generate candidates efficiently the algorithm calculates the support for each item set. The support is the fraction of transactions that contain the itemset. The algorithm discards the itemset if the support is below the minimum support threshold. If the support is above the threshold, the algorithm builds larger itemsets with it and repeats the process until it runs out of itemsets. To prune the generated rules down, the algorithm calculates the confidence of the rule. The confidence shows how frequently items in Y appear in transactions that contain X. The algorithm starts with rules with the highest number of items, and if the confidence does not meet the confidence threshold then it discards that rule and any rule with the same right-hand side item. This results in a list of rules that includes the rule’s support, confidence, and lift. The lift is a measure of dependent or correlated events. It is analyzed because support and confidence are limited and could sometimes be misleading. A lift value greater than 1 indicates that the items in the rule and appear more often together than expected, and that the rule is meaningful.
+
+```{r}
+# set the seed
+set.seed(1234)
+```
+
+### Pre-processing for ARM
+```{r}
+# Remove the Price column which has been discretized into Cost Category
+arm_laptops <- laptops[,!names(laptops) %in% c("Price")]
+
+# Discretize Rating
+arm_laptops$Rating <- as.ordered(cut(arm_laptops$Rating, breaks = c(0,0.5,1.5,2.5,3.5,4.5,5.1), 
+                labels = c("zero", "one", "two", "three", "four", "five"),
+                right=FALSE))
+# Discretize Number of Ratings
+arm_laptops$No_of_ratings <- as.ordered(cut(arm_laptops$No_of_ratings, breaks = c(0,500,1000,1500,2000,2500,3000,6000,14001), 
+                labels = c("0-499","500-999","1000-1499","1500-1999","2000-2499","2500-2999","3000-5999","6000-14000"),
+                right=FALSE))
+# Discretize Review
+arm_laptops$Review <- as.ordered(cut(arm_laptops$Review, breaks = c(0,250,500,750,2001), 
+                labels = c("0-249", "250-499", "500-749", "750-2000"),
+                right=FALSE))
+# Convert Size to facor
+arm_laptops$Size <- factor(arm_laptops$Size)
+# Discretize MRP
+arm_laptops$MRP <- as.ordered(cut(arm_laptops$MRP, breaks = c(0,50000,100000,150000,200000,500001), 
+                labels = c("0-49999", "50000-99999", "100000-149999","150000-199999","200000-500000"),
+                right=FALSE))
+# Discretize Cost Savings
+arm_laptops$CostSavings <- as.ordered(cut(arm_laptops$CostSavings, breaks = c(-Inf,0,200,400,Inf), 
+                labels = c("<$0", "$0-199","$200-399",">=$400"),
+                right=FALSE))
+# Convert DealQuality to facotr
+arm_laptops$DealQuality <- factor(arm_laptops$DealQuality)
+# show the data types
+str(arm_laptops)
+```
+
+The Apriori algorithm was run with support of 0.01 to 0.5 and confidence of 0.7 to 0.9. Running the algorithm with a support threshold of 0.3 and a confidence threshold of 0.8 resulted in the most interesting rules. The top 20 had a confidence of 0.82-0.94 and a lift of 1.58-1.86. Out of the top 20 rules generated, 2 of them had Cores=6 on the right hand side, 5 of the, had CostCategory=Consumer on the right hand side, and the rest had Disk=512 on the right hand side. The most interesting rule associated with CostCategory=Consumer was Rating=four, Review=0-249, DiskGB=512, Cores=6, and DealQuality=1. This indicates that laptops that have 512GB disk memory, 6 cores, a rating of 4, and up to 249 reviews are generally between \$500 to \$1000. The DealQuality value also indicates that these laptops are a relatively low price for components.
+
+```{r}
+# Get the rules
+rules <- apriori(arm_laptops, parameter=list(supp = 0.3, conf=0.8), control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, by="lift", decreasing=TRUE)
+# Inspect the top 20 rules 
+as(rules_non_redundant[1:20], "data.frame")
+# Visualize the rules in a map
+plot(rules_non_redundant[1:20],method="graph", shading=NULL, main="Figure 39 - ARM Graph Plot")
+```
+
+```{r}
+plot(rules, main="Figure 40 - ARM Rules Plot", color=syracuseOrange)
+```
+
+### ARM with Cost Category set on the right hand side
+
+Setting the CostCategory=Lightweight variable as the right-hand side ensures the generated rules show what variable values generally correlate with the laptops that cost between 0 and $500. The algorithm was run with a support of 0.001 to 0.9 and a confidence of 0.7 to 0.9. Running the algorithm with a support threshold of 0.01 and a confidence threshold of 0.8 resulted in the most interesting rules. The top 20 had a confidence of 1 and a lift of 5.4. The rules contained many of the smaller components like RAM=4, DiskGB=256, and Cores=2 which is to be expected. The interesting thing about these rules is that the Company Lenovo is grouped with CostSavings=\$200-399 whereas ASUS is grouped with CostSavings=\$0-199.
+
+```{r}
+# Get the rules
+rules<-apriori(data=arm_laptops, parameter=list(supp=0.01,conf = 0.7), 
+               appearance = list(default="lhs",rhs="CostCategory=Lightweight"),
+               control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, decreasing=TRUE,by="lift")
+# Inspect the top 20 rules 
+as(rules_non_redundant[1:20], "data.frame")
+# Visualize the rules in a map
+plot(rules[1:20],method="graph", shading=NULL, main="Figure 41 - ARM Graph Plot")
+```
+
+Setting the CostCategory=Consumer variable as the right-hand side ensures the generated rules show what variable values generally correlate with the laptops that cost between \$500 and \$1000. The algorithm was run with a support of 0.001 to 0.9 and a confidence of 0.7 to 0.9. Running the algorithm with a support threshold of 0.01 and a confidence threshold of 0.8 resulted in the most interesting rules. The top 20 had a confidence of 1 and a lift of 1.93. The rules contained components like RAM=8, Cores=6, Size=40, and DiskGB=512. The interesting thing about these rules is that the Companys acer and Dell are grouped with DealQuality=1. The rules also contain Lenovo, ASUS, and HP indicating the variety of options at the Consumer level.
+
+```{r}
+# Get the rules
+rules<-apriori(data=arm_laptops, parameter=list(supp=.01,conf = 0.8), 
+               appearance = list(default="lhs",rhs="CostCategory=Consumer"),
+               control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, decreasing=TRUE,by="lift")
+# Inspect the top 20 rules 
+as(rules_non_redundant[1:20], "data.frame")
+# Visualize the rules in a map
+plot(rules[1:20],method="graph", shading=NULL, main="Figure 41 - ARM Graph Plot")
+```
+
+Setting the CostCategory=Commercial variable as the right-hand side ensures the generated rules show what variable values generally correlate with the laptops that cost between \$1000 and \$2000. The algorithm was run with a support of 0.001 to 0.02 and a confidence of 0.7 to 0.9. Running the algorithm with a support threshold of 0.02 and a confidence threshold of 0.8 resulted in the most interesting rules. The top 20 had a confidence of 0.85-1 and a lift of 4.06-4.8. The rules contained components like RAM=16, Cores=8, and DiskGB=1000. The interesting thing about these rules is that the DealQuality=0 and CostSavings=$200-399 are in many of the rules. This indicates that the laptops over \$1000 may not be worth it unless the components are necessary.
+
+```{r}
+# Get the rules
+rules<-apriori(data=arm_laptops, parameter=list(supp=.02,conf = 0.8), 
+               appearance = list(default="lhs",rhs="CostCategory=Commercial"),
+               control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, decreasing=TRUE,by="lift")
+# Inspect the top 20 rules 
+as(rules_non_redundant[1:20], "data.frame")
+# Visualize the rules in a map
+plot(rules[1:20],method="graph", shading=NULL, main="Figure 41 - ARM Graph Plot")
+```
+Setting the CostCategory=Gaming variable as the right-hand side ensures the generated rules show what variable values generally correlate with the laptops that cost between \$2000 and \$3000. The algorithm was run with a support of 0.001 and a confidence of 0.8. The top 20 had a confidence of 0.85-1 and a lift of 4.06-4.8. The rules contained components like RAM=32, Cores=12, and DiskGB=2000. The interesting thing about these rules is that the Company's included Alienware, MSI, acer, Lenovo, and ASUS indicating there are a variety of options at the gaming level.
+
+```{r}
+# Get the rules
+rules<-apriori(data=arm_laptops, parameter=list(supp=.001,conf = 0.8), 
+               appearance = list(default="lhs",rhs="CostCategory=Gaming"),
+               control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, decreasing=TRUE,by="lift")
+# Inspect the top 20 rules 
+as(rules_non_redundant[1:20], "data.frame")
+# Visualize the rules in a map
+plot(rules[1:20],method="graph", shading=NULL, main="Figure 41 - ARM Graph Plot")
+```
+
+Setting the CostCategory=Mining variable as the right-hand side ensures the generated rules show what variable values generally correlate with the laptops that cost between \$3000 and \$4000. The algorithm was run with a support of 0.001 and a confidence of 0.8. The top 20 had a confidence of 1 and a lift of 49.2. The rules contained components like RAM=32, Cores=10, and DiskGB=2000. One interesting thing about these rules is that Size is in the list multiple times and they are all pretty large laptops at sizes 41 to 46cm.
+
+```{r}
+# Get the rules
+rules<-apriori(data=arm_laptops, parameter=list(supp=.001,conf = 0.8), 
+               appearance = list(default="lhs",rhs="CostCategory=Mining"),
+               control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, decreasing=TRUE,by="lift")
+# Inspect the top 20 rules 
+as(rules_non_redundant[1:20], "data.frame")
+# Visualize the rules in a map
+plot(rules[1:20],method="graph", shading=NULL, main="Figure 41 - ARM Graph Plot")
+```
+Setting the CostCategory=Scientific variable as the right-hand side ensures the generated rules show what variable values generally correlate with the laptops that cost over \$4000. The algorithm was run with a support of 0.001 and a confidence of 0.8. The top 14 had a confidence of 1 and a lift of 123. The rules contained components like RAM=32, Cores=10, DiskGB=2000, and Size=43. One interesting thing about these rules is that the companies included MSI, ASUS and Apple. MSI was grouped with a CostSavings=>=$400 so that may be a good company to check out for a good deal.
+
+```{r}
+# Get the rules
+rules<-apriori(data=arm_laptops, parameter=list(supp=.001,conf = 0.8), 
+               appearance = list(default="lhs",rhs="CostCategory=Scientific"),
+               control = list(verbose=F))
+## find non-redundant rules using improvement of confidence
+rules_non_redundant <- rules[!is.redundant(rules)]
+# Sort the rules
+rules_non_redundant<-sort(rules_non_redundant, decreasing=TRUE,by="lift")
+# Inspect the top 20 rules 
+as(rules_non_redundant, "data.frame")
+# Visualize the rules in a map
+plot(rules[1:20],method="graph", shading=NULL, main="Figure 41 - ARM Graph Plot")
+```
+
+All of the following models will use a 2-fold CV training strategy due to the length of time required to test all the parameters and model variations. It's also a consistent base that should allow each model to be compared on a relatively similar baseline. The results will be in the form of an accuracy value determined by the prediction table outputs. 
+
+## Expectation Maximization (EM)
+
+```{r}
+dataset_list <- list("original" = laptops, "numerical" = laptops_num, "normalized" = laptops_norm)
+
+best_em_acc = 0
+best_em_ds = ""
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  classes <- ds$CostCategory
+  mod_ssc <- MclustSSC(ds, classes)
+  pred_ssc <- predict(mod_ssc)
+  t_results = table(Predicted = pred_ssc$classification, Actual = classes, useNA = "ifany")
+  accuracy_results = get_accuracy_rate(t_results, length(classes))
+  
+  if(accuracy_results > best_em_acc)
+  {
+    best_em_acc = accuracy_results
+    best_em_ds = name
+  }
+}
+
+print(paste("The best Expectation Maximization accuracy was", round(best_em_acc, digits = 1), "using the", best_em_ds, "dataset", sep=" "))  
+```
+
+## K-Means
+
+The K-Means algorithm will be testing 2 datasets, 4 different algorithms and 7 different cluster sizes to provide a wide range of possible outcomes. 
+
+```{r, warning=FALSE}
+set.seed(68)
+
+dataset_list <- list("numerical" = laptops_num, "normalized" = laptops_norm)
+algorithms = c("Hartigan-Wong", "Lloyd", "Forgy", "MacQueen")
+cluster_counts = c(2,3,4,5,6,7,8,9)
+
+best_k_acc = 0
+best_k_algo = ""
+best_k_clust = 0
+best_k_model = NULL
+best_k_ds = ""
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  ds_km = ds[,-c(1)]
+  classes <- ds$CostCategory
+  
+  for (algo_name in algorithms)
+  {
+    for(clusters in cluster_counts)
+    {
+      cluster_model <- kmeans(ds_km, clusters, algorithm=algo_name)
+      
+      cluster_model_f <- as.factor(cluster_model$cluster)
+      pred_values = table(cluster_model_f, classes)
+    
+      accuracy_results = get_accuracy_rate(pred_values, length(classes))
+      if(accuracy_results > best_k_acc)
+      {
+        best_k_acc <- accuracy_results
+        best_k_algo <- algo_name
+        best_k_clust <- clusters
+        best_k_model <- cluster_model_f
+        best_k_ds <- name
+      }
+    }
+  }
+}
+
+laptops_num_km = dataset_list[[best_k_ds]][,-c(1)]
+print(clusplot(laptops_num_km, best_k_model, color=TRUE, shade=TRUE, labels=2, lines=0, main=paste("Figure 42.1 -", best_k_algo, "with", best_k_clust, "Clusters", sep=" ")))
+
+print(paste("The best K-Means Clustering accuracy was", round(best_k_acc, digits = 1), "with", best_k_clust, "clusters, using", best_k_algo, "clustering method and the", best_k_ds, "dataset", sep=" ")) 
+
+#Use "elbow method" to find optimal cluster amount
+fviz_nbclust(laptops_num_km, kmeans, method = "wss", k.max = 25) +
+labs(title="Figure 42.2 - Elbow method")
+
+# Create a dataframe for the K Means analysis
+laptops_km <- laptops_num
+
+# Add the clusters to laptops_km
+laptops_km$cluster <- as.factor(best_k_model)
+
+# Create a bar plot of Cost Category and documents, showing the cluster assignment
+ggplot(data=laptops_km, aes(x=CostCategory, fill=cluster)) +
+  geom_bar(stat="count") +
+  labs(title = "Figure 42.3 - Clusters by Cost Category", x="", y="Count") +
+  theme(plot.title = element_text(hjust=0.5), text=element_text(size=15))
+```
+
+## Hierachical Agglomerative Clustering (HAC)
+
+The HAC will be testing 2 different datasets, 6 different distance functions, 8 different clustering methods and four cluster counts to test a large number of options and find a best fit model. 
+
+```{r, warning=FALSE}
+set.seed(23)
+
+dataset_list <- list("numerical" = laptops_num, "normalized" = laptops_norm)
+distance_methods = c("euclidean", "maximum", "manhattan", "canberra", "binary", "minkowski")
+cluster_methods = c("ward.D", "ward.D2", "single", "complete", "average", "mcquitty", "median", "centroid")
+cluster_counts = c(3, 6, 9, 12)
+
+best_hac_acc = 0
+best_hac_dist = ""
+best_hac_clust = ""
+best_hac_clust_count = 0
+best_hac_ds = ""
+
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  for (distance_name in distance_methods)
+  {
+    for (cluster_name in cluster_methods)
+    {
+      for(clusters in cluster_counts)
+      {
+        new_test_just_label = ds[,c(1)]
+        distance = dist(ds[,-c(1)], method = distance_name)
+        hac = hclust(distance, method=cluster_name)
+        cut = cutree(hac, clusters)
+        pred_values = table(cut, new_test_just_label)
+    
+        hac_acc = get_accuracy_rate(pred_values, length(new_test_just_label))
+    
+        if(hac_acc > best_hac_acc)
+        {
+          best_hac_acc = hac_acc
+          best_hac_dist = distance_name
+          best_hac_clust = cluster_name
+          best_hac_clust_count = clusters
+          best_hac = hac
+          best_hac_ds = name
+        }
+      }
+    }
+  }
+}
+
+plot(best_hac, cex=0.6, hang=-1, main=paste("Figure 43.1 - HAC with", best_hac_clust_count, "clusters", sep=" "))
+rect.hclust(best_hac, k=best_hac_clust_count, border=2:5)
+
+print(paste("The best Heirarchical Agglomerative Clustering accuracy was", round(best_hac_acc, digits = 1), "with", best_hac_clust_count, "clusters, using", best_hac_dist, "distance method and", best_hac_clust, "clustering method using the", best_hac_ds, "dataset", sep=" "))  
+
+# Create a dataframe for the HAC analysis
+laptops_hac <- dataset_list[[best_hac_ds]]
+
+# add the cluster assignment to laptops_hac
+laptops_hac$cluster <- as.factor(cutree(best_hac, 6))
+
+# Create a bar plot of cost  and documents, showing the cluster assignment
+ggplot(data=laptops_hac, aes(x=CostCategory, fill=cluster)) +
+  geom_bar(stat="count") +
+  labs(title = "Figure 43.2 - HAC Clustering",x="") +
+  theme(plot.title = element_text(hjust=0.5), text=element_text(size=15))
+```
+
+## Decision Tree
+
+The Decision Tree uses 6 different control parameters to test to determine which might perform the best. It uses the original, numerical and normalized laptop data sets. The model will also prune the branch with the highest error value prior to making predictions.
+
+```{r,Warning=F}
+set.seed(374)
+
+dataset_list <- list("original" = laptops, "numerical" = laptops_num, "normalized" = laptops_norm)
+control_list = vector(mode = "list", length = 6)
+control_list[[1]]= rpart.control(cp=0)
+control_list[[2]]= rpart.control(cp=0, minsplit = 2, maxdepth = 5)
+control_list[[3]]= rpart.control(cp=0, minsplit = 2, maxdepth = 10)
+control_list[[4]]= rpart.control(cp=0.1, minsplit = 2, maxdepth = 5)
+control_list[[5]]= rpart.control(cp=0.1, minsplit = 3, maxdepth = 5)
+control_list[[6]]= rpart.control(cp=0.3, minsplit = 5, maxdepth = 10)
+best_tree_acc = 0
+best_tree_pos = 0
+best_tree = NULL
+best_tree_ds = ""
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  for(pos in 1:6)
+  {
+    tree_acc = train_tree(ds, control_list[[pos]])
+    
+    if(tree_acc > best_tree_acc)
+    {
+      best_tree_acc = tree_acc
+      best_tree_pos = pos
+      best_tree = tree_acc
+      best_tree_ds = name
+    }
+  }
+}
+
+print(paste("The best Decision Tree accuracy was", round(best_tree_acc, digits = 1), "using control", best_tree_pos, "and the", best_tree_ds, "dataset", sep=" "))
+
+tree_model <- rpart(CostCategory ~ ., laptops, method="class", control=control_list[[2]])
+pruned_tree_model <- prune(tree_model, cp=tree_model$cptable[which.min(tree_model$cptable[,"xerror"]),"CP"])
+print(rpart.plot(pruned_tree_model,main="Figure 44 - Decision Tree"))
+```
+
+## Naive Bayes
+
+The Naive Bayes model will train against the original, numerical and normalized laptops dataset. The Laplace parameters didn't appear to fit here considering there weren't expected to be any categories with no values. 
+
+```{r}
+set.seed(111)
+library(klaR)
+dataset_list <- list("original" = laptops, "numerical" = laptops_num, "normalized" = laptops_norm)
+best_bayes_acc = 0
+best_bayes_ds = ""
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  bayes_acc = train_bayes(ds)
+  if(bayes_acc > best_bayes_acc)
+  {
+    best_bayes_acc = bayes_acc
+    best_bayes_ds = name
+  }
+}
+
+print(paste("The best Naive Bayes accuracy is", round(best_bayes_acc, digits = 1), "using the", best_bayes_ds, "dataset", sep=" "))
+```
+
+## KNN
+
+The K-Nearest Neighbor model will use five different K values to train with and will use the numerical and normalized laptops training set. 
+
+```{r}
+set.seed(862)
+
+dataset_list <- list("numerical" = laptops_num, "normalized" = laptops_norm)
+k_vals = c(2,3,5,7,9)
+best_knn_acc = 0
+best_knn_pos = 0
+best_knn_ds = ""
+for (name in names(dataset_list)) 
+{
+  ds_knn = dataset_list[[name]]
+  ds_knn$CostCategory = as.numeric(ds_knn$CostCategory)
+
+  for(num in k_vals)
+  {
+    knn_acc = train_knn(ds_knn, num)
+    
+    if(knn_acc > best_knn_acc)
+    {
+      best_knn_acc = knn_acc
+      best_knn_pos = num
+      best_knn_ds = name
+    }
+  }
+}
+
+print(paste("The best K-Nearest Neighbor accuracy is", round(best_knn_acc, digits = 1), "where k =", best_knn_pos, "using the", best_knn_ds, "dataset", sep=" "))
+```
+
+## SVM
+
+The Support Vector Machine model will test against 3 kernels and 4 costs parameters. The model will train against the original, numerical and normalized laptop dataset. 
+
+```{r, warning=FALSE}
+set.seed(213)
+
+best_svm_acc = 0
+best_svm_kernel = ""
+best_svm_cost = 0
+best_svm_ds = ""
+dataset_list <- list("original" = laptops, "numerical" = laptops_num, "normalized" = laptops_norm)
+kernel_list = c("radial", "polynomial", "sigmoid")
+cost_list = c(30, 60, 90, 120)
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  for(kernel in kernel_list)
+  {
+    for(cost in cost_list)
+    {
+      svm_acc = train_svm(ds, kernel, cost)
+      
+      if(svm_acc > best_svm_acc)
+      {
+        best_svm_acc = svm_acc
+        best_svm_kernel = kernel
+        best_svm_cost = cost
+        best_svm_ds = name
+      } 
+    }
+  }
+}
+
+print(paste("The best Support Vector Machine accuracy is", round(best_svm_acc, digits = 1), "using", best_svm_kernel, "kernel with cost", best_svm_cost, "using the", best_svm_ds, "dataset", sep=" "))
+```
+
+## Random Forest
+
+The Random Forest model trains against the original, numerical and normalized laptops training set 3 times each. It also uses the sample with replacement parameter set to true. 
+
+```{r}
+set.seed(77)
+
+best_rf_acc = 0
+best_rf_bin_acc = 0
+best_rf_ds = ""
+dataset_list <- list("original" = laptops, "numerical" = laptops_num, "normalized" = laptops_norm)
+for (name in names(dataset_list)) 
+{
+  ds = dataset_list[[name]]
+  for (select in 1:3) 
+  {
+    forest_acc = train_forest(laptops_num, TRUE)
+    best_rf_acc = if(forest_acc > best_rf_acc) forest_acc else best_rf_acc
+    best_rf_ds = name
+  }  
+}
+
+paste("The best Random Forest accuracy is", round(best_rf_acc, digits = 1), "using the", best_rf_ds, "dataset", sep=" ")  
+```
+
+## Aggregated Results
+
+The aggregated best model accuracy results were:
+
+* Expectation Maximization:              99.9% (normalized dataset)
+* K-Means:                               57.8% (numerical dataset)
+* Heirarchical Agglomerative Clustering: 73.5% (numerical dataset)
+* Decision Tree:                         99.7% (original dataset)
+* Naive Bayes:                           87.5% (numerical dataset)
+* K-Nearest Neighbor:                    99.7% (normalized dataset)
+* Support Vector Machine:                93.7% (original dataset)
+* Random Forest:                         99% (normalized dataset)
+
+# Conclusion
+
+The exploratory data analysis was fairly robust and there were many valuable findings but this analysis was focused on understanding the price. It was clear from numerous plots that RAM size, disk size and CPU core count were highly correlated with price but more interesting was how the ratings had no significant correlation and cost savings was minor. We attributed the ratings to the website not wanting to risk promoting products that wouldn't sell, making their brand look bad. The majority of prices were under $1000 but there were a few brands that stood out for higher prices like Alienware (really a subcompany of Dell), Apple and Asus. Apple not only had a higher premium but a higher price floor. Many of the laptops with higher prices also had high-end components which was intuitive. The higher end components had curved prices that rose quite quickly for the best parts. This also followed a steep drop off in the number of them in the dataset. This was attributed to it being cost-prohibitive. The site would offer some but it would be risky to purchase and hold that much inventory unless they thought they could sell it. When looking at the processor manufacturer, Intel made most of the processors in use but AMD had a slight price premium. MRP offered an interesting insight. By comparing the difference with the actual price, a cost savings could be determined. This showed a small but significant number of laptops that had a steep over-charge. It was mostly Apple and Lenovo laptops but only Apple had the high value components. The main cost categories showed that the majority of the laptops were in the bottom three categories: Lightweight, Consumer and Commercial. There was a significant group of Gaming laptops but few of the top tier models. 
+  
+Association Rule Mining resulted in rules that showed differences in components and companies. The rules where CostCategory=Lightweight was set as the right hand side had many of the smaller components like RAM=4, DiskGB=256, and Cores=2 which is to be expected. The interesting thing about these rules is that the Company Lenovo is grouped with CostSavings=$200-399 whereas ASUS is grouped with CostSavings=$0-199. The rules where CostCategory=Consumer was set on the right hand side had the companies acer and Dell grouped with DealQuality=1. The rules also contain Lenovo, ASUS, and HP indicating the variety of options at the Consumer level. For hardware, the rules contained components like RAM=8, Cores=6, Size=40, and DiskGB=512. The most interesting rule was Rating=four, Review=0-249, DiskGB=512, Cores=6, and DealQuality=1. This indicates that laptops that have 512GB disk memory, 6 cores, a rating of 4, and up to 249 reviews are generally between $500 to $1000. The DealQuality value also indicates that these laptops are a relatively low price for components.
+
+The rules where CostCategory=Commercial was set on the right hand side had DealQuality=0 and CostSavings=$200-399 in many of the rules. This indicates that the laptops over $1000 may not be worth it unless the components are necessary. The components in these rules included RAM=16, Cores=8, and DiskGB=1000. The rules where CostCategory=Gaming was set on the right hand side had the companies Alienware, MSI, acer, Lenovo, and ASUS indicating there are a variety of options at the gaming level. The Gaming rules contained components like RAM=32, Cores=12, and DiskGB=2000. The rules where CostCategory=Mining contained sizes 41 to 46cm, which is different than the rest of the cost categories. These Mining rules contained other components like RAM=32, Cores=10, and DiskGB=2000. The rules where CostCategory=Scientifics included companies MSI, ASUS and Apple. MSI was grouped with a CostSavings=>=$400 so that may be a good company to check out for a good deal. The Scientific rules contained components like RAM=32, Cores=10, DiskGB=2000, and Size=43.
+
+Designing the dataset had many opportunities to pursue but at each point where you significantly modify the dataset, there's the possibility the model may be affected by that change. To allow for the discovery of best combinations of dataset and model without overwhelming the time with discovery, we looped through three datasets: the original, a numerical version and a normalized version. Not all models would accept the original dataset but many would. Nearly every model tested produced a high prediction rate. Three of the four top models used the normalized dataset. This was intuitive and expected given that scaling values would put the variables in context and potentially allow the model to better understand the data. There were concerns that such high training results indicated a possible case of overfitting but given we used 5 fold cross-validation to confirm out results and were confident they were valid. We also considered the affect the correlation between predictors like RAM, DiskGB and Cores. Given they were different component parts with different ranges and despite that they were very highly close in correlation value, we thought keeping them distinct may allow more nuance in the learning process.
+
+# References
+[Create an Ordered Factor](https://campus.datacamp.com/courses/introduction-to-r-for-finance/factors-4?ex=8)  
+[Finding the Intersection Between Two Vectors](https://stackoverflow.com/questions/45271448/r-finding-intersection-between-two-vectors)  
+[Dealing with Special Characters In Regex](https://stackoverflow.com/questions/27721008/how-do-i-deal-with-special-characters-like-in-my-regex)  
+[MediaTek mt8788](https://www.mediatek.com/products/tablets/mt8788)  
+[MediaTek Kompanio 500](https://www.mediatek.com/products/chromebooks/mediatek-kompanio-500)  
+[Apple M1 Processor](https://en.wikipedia.org/wiki/Apple_M1)  
+[Apple M2 Processor](https://en.wikipedia.org/wiki/Apple_M2)  
+[Intel i3 Processor](https://en.wikipedia.org/wiki/List_of_Intel_Core_i3_processors)  
+[Intel i5 Processor](https://en.wikipedia.org/wiki/List_of_Intel_Core_i5_processors)  
+[Intel i7 Processor](https://en.wikipedia.org/wiki/List_of_Intel_Core_i7_processors)  
+[Intel i9 Processor](https://en.wikipedia.org/wiki/List_of_Intel_Core_i9_processors)  
+[Count overlapping points](https://ggplot2.tidyverse.org/reference/geom_count.html)  
+[making barplot for distribution of a continuous variable](https://stackoverflow.com/questions/43765618/making-barplot-for-distribution-of-a-continuous-variable)  
+[Pairs Plot with GGPairs](https://r-charts.com/correlation/ggpairs/)  
+[Increase plot size (width) in ggplot2](https://stackoverflow.com/questions/29587881/increase-plot-size-width-in-ggplot2)  
+[R apply function with multiple parameters](https://stackoverflow.com/questions/6827299/r-apply-function-with-multiple-parameters)  
+[Does the ternary operator exist in R?](https://stackoverflow.com/questions/8790143/does-the-ternary-operator-exist-in-r)  
+[How to sum leading diagonal of table in R](https://stackoverflow.com/questions/5648500/how-to-sum-leading-diagonal-of-table-in-r)  
